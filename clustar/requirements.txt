@@ -1,0 +1,13 @@
+# CluSTAR Requirements
+torch>=1.10.0
+torchvision>=0.11.0
+numpy>=1.21.0
+scikit-learn>=1.0
+matplotlib>=3.4
+seaborn>=0.11
+pyyaml>=5.4
+tqdm>=4.62
+
+# Optional: for enhanced visualizations
+plotly>=5.0  # optional
+wandb>=0.12  # optional (experiment tracking)
