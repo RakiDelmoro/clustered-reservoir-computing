@@ -26,7 +26,6 @@ class MetricsCalculator:
         self.action_names = action_names or [
             "moving",
             "spinning",
-            "collision",
             "stationary",
         ]
 

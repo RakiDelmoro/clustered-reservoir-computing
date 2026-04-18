@@ -5,8 +5,8 @@
 **Core Components Implemented:**
 
 1. **Moving MNIST Generator** (`data/generator.py`)
-   - Synthetic dataset with 4 action classes
-   - Physics simulation: bouncing, rotation, collision detection
+   - Synthetic dataset with 3 action classes
+   - Physics simulation: bouncing, rotation
    - 50K train / 10K val / 10K test labeled sequences
    - 200K unlabeled sequences for pre-training
 
@@ -79,7 +79,7 @@ clustar/
 ├── configs/
 │   └── reservoir.yaml          ← All hyperparameters
 ├── data/
-│   ├── generator.py            ← 4-action Moving MNIST
+│   ├── generator.py            ← 3-action Moving MNIST
 │   └── dataset.py              ← PyTorch Dataset/DL
 ├── models/
 │   ├── encoder.py              ← Random projection

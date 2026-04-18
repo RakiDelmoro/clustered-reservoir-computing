@@ -1,18 +1,12 @@
-"""Neural network models: encoder, reservoir, readouts, baselines."""
+"""Neural network models: encoder, reservoir, readout."""
 
-from .encoder import SpatialEncoder, RandomOrthogonalProjection
+from .encoder import SpatiotemporalEncoder
 from .reservoir import ClusteredReservoir
-from .readout import MultiTaskReadout, RidgeRegression
-from .vanilla_esn import VanillaESN
-from .lstm_baseline import LSTMBaseline, LSTMWrapper
+from .readout import ActionReadout, RidgeRegression
 
 __all__ = [
-    "SpatialEncoder",
-    "RandomOrthogonalProjection",
+    "SpatiotemporalEncoder",
     "ClusteredReservoir",
-    "MultiTaskReadout",
+    "ActionReadout",
     "RidgeRegression",
-    "VanillaESN",
-    "LSTMBaseline",
-    "LSTMWrapper",
 ]

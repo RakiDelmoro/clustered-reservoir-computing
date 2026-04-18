@@ -1,50 +1,41 @@
 # CluSTAR: Clustered Spatio-Temporal Reservoir Computing
-# Project configuration
+# Action Classification Configuration
 
 data:
   img_size: 28
   img_channels: 1
-  seq_length: 30
-  canvas_size: 64  # pad 28x28 to 64x64 for motion
-  num_digits: 1
-  digit_class_range: [0, 9]  # MNIST digits
+  seq_length: 60
+  canvas_size: 64
+  digit_class_range: [0, 9]
 
-  # Action definitions
   actions:
-    moving: {v_range: [2, 6], rotation: false, collision: false}
-    spinning: {v_range: [0, 1], rotation: true, omega_range: [5, 20], collision: false}
-    collision: {v_range: [3, 7], rotation: false, collision: true, num_digits: 2}
-    stationary: {v_range: [0, 0.5], rotation: false, collision: false}
+    moving: {v_range: [2, 6], rotation: false}
+    spinning: {v_range: [0, 0.1], rotation: true, omega_range: [60, 180]}
+    stationary: {v_range: [0, 0], rotation: false}
 
-  # Dataset sizes
   train_samples: 50000
   val_samples: 10000
   test_samples: 10000
-  pretrain_samples: 200000  # unlabeled
 
 reservoir:
-  # Spatial encoder
   encoder:
-    input_dim: 4096  # 64x64 flattened (canvas_size)
-    output_dim: 128  # D
-    type: "random_orthogonal"  # or "random_normal"
+    spatial_dim: 512
+    temporal_dim: 256
+    output_dim: 768
 
-  # Structured reservoir
-  size: 1000  # N total neurons
+  size: 1000
   num_clusters: 10
   neurons_per_cluster: 100
 
-  # Connectivity (small-world)
   cluster:
-    within_prob: 0.3  # dense intra-cluster
-    between_prob: 0.02  # sparse inter-cluster
-    rewiring_prob: 0.1  # Watts-Strogatz rewiring
+    within_prob: 0.3
+    between_prob: 0.02
+    rewiring_prob: 0.1
 
-  # Multi-timescale dynamics
   timescales:
     - name: "fast"
-      fraction: 0.3  # 30% of neurons
-      alpha_range: [0.2, 0.4]  # leaking rate
+      fraction: 0.3
+      alpha_range: [0.2, 0.4]
       spectral_radius_range: [0.7, 0.85]
     - name: "medium"
       fraction: 0.4
@@ -55,87 +46,48 @@ reservoir:
       alpha_range: [0.8, 1.0]
       spectral_radius_range: [0.9, 0.99]
 
-  # Input routing
-  routing:
-    enabled: true
-    streams: ["position", "velocity", "rotation", "shape"]
-    stream_dims:
-      position: 2    # (x, y) digit centroid
-      velocity: 2    # (vx, vy) from frame differencing  
-      rotation: 1    # angle in radians
-      shape: 7       # Hu moments or PCA features from digit mask
-    # Each stream is routed to specific cluster groups
-
-  # Reservoir dynamics
-  activation: "tanh"
   input_scaling: 0.5
   bias_scaling: 0.1
-  spectral_radius_global: 0.95  # target max eigenvalue
+  spectral_radius_global: 0.95
+  activation: "mixed"
 
-pretrain:
-  # Self-supervised tasks
-  tasks:
-    frame_prediction:
-      enabled: true
-      weight: 1.0
-      horizon: 1  # predict next frame
-    temporal_order:
-      enabled: true
-      weight: 0.3
-      delta_range: [2, 5]  # frame offset for ordering
-    speed_regression:
-      enabled: true
-      weight: 0.2
-    segmentation:
-      enabled: true
-      weight: 0.3
-    rotation_contrast:
-      enabled: true
-      weight: 0.2
-      temperature: 0.1
+  layer2:
+    size: 500
+    num_clusters: 5
+    cluster:
+      within_prob: 0.3
+      between_prob: 0.02
+      rewiring_prob: 0.1
 
-  # State collection
-  batch_size: 64
-  num_workers: 4
-  shuffle: false  # preserve temporal order
+    timescales:
+      - name: "fast"
+        fraction: 0.5
+        alpha_range: [0.7, 1.0]
+        spectral_radius_range: [0.8, 0.95]
+      - name: "medium"
+        fraction: 0.3
+        alpha_range: [0.5, 0.7]
+        spectral_radius_range: [0.75, 0.9]
+      - name: "slow"
+        fraction: 0.2
+        alpha_range: [0.3, 0.5]
+        spectral_radius_range: [0.7, 0.85]
 
-  # Ridge regression settings
-  ridge_lambda: 1e-6
-  multi_task:
-    joint_training: true  # train all tasks simultaneously
-    normalize_targets: true
+    input_scaling: 0.3
+    bias_scaling: 0.1
+    spectral_radius_global: 0.95
+    activation: "mixed"
 
 finetune:
-  # Downstream action classification
-  task: "action_classification"
-  num_classes: 4
+  num_classes: 3
+  ridge_lambda: 100.0
   batch_size: 64
-  ridge_lambda: 1e-4
-  use_pretrained_init: true  # init W_action from W_ss
-
-  # Training schedule
-  train_samples: 50000
-  val_samples: 10000
-  test_samples: 10000
-
-  # Evaluation
-  metrics: ["accuracy", "f1_score", "confusion_matrix"]
+  num_workers: 0
 
 training:
   seed: 42
-  device: "cuda"  # or "cpu"
-  log_interval: 100
-
-logging:
-  wandb:
-    enabled: false
-    project: "clustar-reservoir"
-    entity: null
-  checkpoint_dir: "checkpoints/"
-  log_dir: "logs/"
+  device: "cuda"
 
 visualization:
   enabled: true
-  plot_interval: 1000
-  save_states: false  # save reservoir states for analysis
-  tsne_perplexity: 30
+  tsne_perplexity: 50

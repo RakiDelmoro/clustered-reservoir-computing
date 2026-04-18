@@ -1,39 +1,35 @@
 """
-Downstream Fine-tuning for Action Classification.
-Uses pre-trained CluSTAR reservoir and trains linear classifier via ridge regression.
+Action classification via ridge regression on frozen CluSTAR reservoir states.
 """
 
 import torch
-import yaml
 import numpy as np
-from pathlib import Path
 from torch.utils.data import DataLoader
 from typing import Dict, Tuple, Optional
-from models.reservoir import ClusteredReservoir
-from models.encoder import SpatialEncoder
-from models.readout import RidgeRegression, MultiTaskReadout
-from data.dataset import get_dataloaders
-import json
+from tqdm import tqdm
+from clustar.models.reservoir import ClusteredReservoir
+from clustar.models.deep_reservoir import DeepReservoir
+from clustar.models.encoder import SpatiotemporalEncoder
+from clustar.models.readout import RidgeRegression, ActionReadout
 
 
 class ActionClassifier:
     """
-    Fine-tunes a linear classifier on top of frozen CluSTAR reservoir states.
+    Trains linear classifier on top of frozen DeepReservoir states.
+    Dual-layer per-cluster temporal aggregation + feature standardization + ridge regression.
     """
 
     def __init__(
         self,
-        reservoir: ClusteredReservoir,
-        encoder: SpatialEncoder,
+        reservoir: DeepReservoir,
+        encoder: SpatiotemporalEncoder,
         config: Dict,
-        checkpoint_path: Optional[str] = None,
     ):
         self.reservoir = reservoir
         self.encoder = encoder
         self.config = config
         self.device = torch.device(config["training"]["device"])
 
-        # Freeze reservoir and encoder
         self.reservoir.eval().to(self.device)
         for param in self.reservoir.parameters():
             param.requires_grad = False
@@ -41,67 +37,65 @@ class ActionClassifier:
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        # Readout (classifier)
-        self.readout = MultiTaskReadout(
-            reservoir_size=config["reservoir"]["size"],
-            task_configs={"action_classification": {"enabled": True}},
-            device=self.device,
+        l1_size = config["reservoir"]["size"]
+        l2_size = config["reservoir"]["layer2"]["size"]
+        feature_dim = l1_size * 4 + l2_size * 4
+
+        self.readout = ActionReadout(
+            feature_dim=feature_dim,
+            num_classes=config["finetune"]["num_classes"],
         ).to(self.device)
-
-        # Load pre-trained weights if available
-        if checkpoint_path:
-            self._load_pretrained(checkpoint_path)
-
-        # Metrics tracking
-        self.train_acc = []
-        self.val_acc = []
-
-    def _load_pretrained(self, path: str):
-        """Load pre-trained readout weights (optional)."""
-        ckpt = torch.load(path, map_location=self.device)
-        # Only load if task exists in checkpoint
-        if "frame_prediction" in ckpt.get("solutions", {}):
-            print("Note: Pre-trained readout found but not used for initialization")
-            # Could initialize from pre-trained features if desired
 
     @torch.no_grad()
     def extract_features(
-        self, dataloader: DataLoader, aggregation: str = "mean"
+        self, dataloader: DataLoader
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Run reservoir over dataset and extract state features.
-
-        Args:
-            dataloader: labeled data
-            aggregation: how to pool temporal dimension: 'mean', 'last', 'cat_last3'
+        Run deep reservoir over dataset and extract dual-layer aggregated features.
 
         Returns:
-            X: [num_samples, reservoir_size] features
+            X: [num_samples, 4*L1 + 4*L2] features
             y: [num_samples] labels
         """
         features = []
         labels = []
 
         print(f"Extracting features from {len(dataloader)} batches...")
-        for batch in dataloader:
-            frames = batch["frames"].to(self.device)  # [B, T, 1, H, W]
+        for batch in tqdm(
+            dataloader, desc="Extracting features", total=len(dataloader)
+        ):
+            frames = batch["frames"].to(self.device)
             labels_batch = batch["label"].to(self.device)
 
             B, T = frames.shape[0], frames.shape[1]
-            flat_frames = frames.view(B * T, 1, 64, 64)
-            encoded = self.encoder(flat_frames).view(B, T, -1)  # [B, T, D]
+            encoded = self.encoder(frames)
 
-            states, _ = self.reservoir.forward_sequence(encoded)  # [B, T, N]
+            states_L1, states_L2, _, _ = self.reservoir.forward_sequence(encoded)
 
-            # Temporal aggregation
-            if aggregation == "mean":
-                feats = states.mean(dim=1)  # [B, N]
-            elif aggregation == "last":
-                feats = states[:, -1, :]  # [B, N]
-            elif aggregation == "cat_last3":
-                feats = states[:, -3:, :].reshape(B, -1)  # [B, 3N]
-            else:
-                raise ValueError(f"Unknown aggregation: {aggregation}")
+            cluster_assignments_L1 = self.reservoir.layer1.cluster_assignments
+            num_clusters_L1 = self.reservoir.layer1.num_clusters
+            cluster_feats = []
+            for c in range(num_clusters_L1):
+                mask = cluster_assignments_L1 == c
+                c_states = states_L1[:, :, mask]
+                c0 = c_states[:, 0, :]
+                cT = c_states[:, -1, :]
+                c_mean = c_states.mean(dim=1)
+                c_max = c_states.max(dim=1)[0]
+                cluster_feats.extend([c0, cT, c_mean, c_max])
+
+            cluster_assignments_L2 = self.reservoir.layer2.cluster_assignments
+            num_clusters_L2 = self.reservoir.layer2.num_clusters
+            for c in range(num_clusters_L2):
+                mask = cluster_assignments_L2 == c
+                c_states = states_L2[:, :, mask]
+                c0 = c_states[:, 0, :]
+                cT = c_states[:, -1, :]
+                c_mean = c_states.mean(dim=1)
+                c_max = c_states.max(dim=1)[0]
+                cluster_feats.extend([c0, cT, c_mean, c_max])
+
+            feats = torch.cat(cluster_feats, dim=1)
 
             features.append(feats.cpu())
             labels.append(labels_batch.cpu())
@@ -116,27 +110,19 @@ class ActionClassifier:
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        ridge_lambda: Optional[float] = None,
     ) -> Dict[str, float]:
         """
-        Train linear classifier via ridge regression.
-
-        Args:
-            train_loader: training data
-            val_loader: validation data
-            ridge_lambda: regularization strength (from config if None)
+        Train linear classifier via ridge regression with feature standardization.
 
         Returns:
             metrics dict with train/val accuracy
         """
-        if ridge_lambda is None:
-            ridge_lambda = self.config["finetune"]["ridge_lambda"]
+        ridge_lambda = self.config["finetune"]["ridge_lambda"]
 
         print("\n" + "=" * 60)
         print("DOWNSTREAM FINE-TUNING")
         print("=" * 60)
 
-        # Extract features from train and val
         X_train, y_train = self.extract_features(train_loader)
         X_val, y_val = self.extract_features(val_loader)
 
@@ -144,23 +130,31 @@ class ActionClassifier:
             f"\nTraining on {len(X_train)} samples, validating on {len(X_val)} samples"
         )
 
-        # Convert labels to one-hot for ridge regression
+        # Standardize features
+        feat_mean = X_train.mean(dim=0, keepdim=True)
+        feat_std = X_train.std(dim=0, keepdim=True).clamp(min=1e-8)
+        self.feat_mean = feat_mean
+        self.feat_std = feat_std
+        X_train_scaled = (X_train - feat_mean) / feat_std
+        X_val_scaled = (X_val - feat_mean) / feat_std
+
+        # Convert labels to one-hot
         num_classes = self.config["finetune"]["num_classes"]
-        y_train_onehot = torch.zeros(len(y_train), num_classes, device=self.device)
-        y_train_onehot.scatter_(1, y_train.unsqueeze(1), 1.0)
+        y_train_cpu = y_train.to("cpu")
+        y_train_onehot = torch.zeros(len(y_train_cpu), num_classes, device="cpu")
+        y_train_onehot.scatter_(1, y_train_cpu.unsqueeze(1), 1.0)
 
-        # Train ridge regression
+        # Solve ridge regression
         print(f"Solving ridge regression (λ={ridge_lambda})...")
-        ridge = RidgeRegression()
-        W, b = ridge.solve(X_train, y_train_onehot, lambd=ridge_lambda, bias=True)
+        W, b = RidgeRegression.solve(
+            X_train_scaled, y_train_onehot, lambd=ridge_lambda, bias=True
+        )
 
-        # Set readout weights
-        self.readout.heads["action_classification"].weight.data = W
-        self.readout.heads["action_classification"].bias.data = b
+        self.readout.head.weight.data = W.to(self.device)
+        self.readout.head.bias.data = b.to(self.device)
 
-        # Evaluate
-        train_acc = self._evaluate(X_train, y_train)
-        val_acc = self._evaluate(X_val, y_val)
+        train_acc = self._evaluate(X_train_scaled, y_train)
+        val_acc = self._evaluate(X_val_scaled, y_val)
 
         print(f"\nResults:")
         print(f"  Train accuracy: {train_acc:.2%}")
@@ -170,28 +164,33 @@ class ActionClassifier:
 
     @torch.no_grad()
     def _evaluate(self, X: torch.Tensor, y: torch.Tensor) -> float:
-        """Compute classification accuracy."""
-        logits = self.readout.forward(X.to(self.device), "action_classification")
+        """Compute classification accuracy. X should already be standardized."""
+        logits = self.readout.forward(X.to(self.device))
         preds = torch.argmax(logits, dim=1)
         correct = (preds.cpu() == y).float().mean()
         return correct.item()
 
+    def _standardize(self, X: torch.Tensor) -> torch.Tensor:
+        """Standardize features using stored mean/std from training set."""
+        if not hasattr(self, "feat_mean"):
+            return X
+        return (X - self.feat_mean) / self.feat_std
+
     def test(self, test_loader: DataLoader) -> Dict[str, float]:
         """Evaluate on test set."""
         X_test, y_test = self.extract_features(test_loader)
-        test_acc = self._evaluate(X_test, y_test)
+        X_test_scaled = self._standardize(X_test)
+        test_acc = self._evaluate(X_test_scaled, y_test)
         print(f"\nTest accuracy: {test_acc:.2%}")
         return {"test_accuracy": test_acc}
 
     def save_model(self, path: str):
-        """Save fine-tuned classifier."""
+        """Save fine-tuned classifier with standardization parameters."""
         save_dict = {
             "readout_state_dict": self.readout.state_dict(),
             "config": self.config,
-            "metrics": {
-                "train_acc": self.train_acc[-1] if self.train_acc else None,
-                "val_acc": self.val_acc[-1] if self.val_acc else None,
-            },
+            "feat_mean": self.feat_mean,
+            "feat_std": self.feat_std,
         }
         torch.save(save_dict, path)
         print(f"Model saved to {path}")
@@ -200,72 +199,7 @@ class ActionClassifier:
         """Load fine-tuned classifier."""
         ckpt = torch.load(path, map_location=self.device)
         self.readout.load_state_dict(ckpt["readout_state_dict"])
+        if "feat_mean" in ckpt:
+            self.feat_mean = ckpt["feat_mean"]
+            self.feat_std = ckpt["feat_std"]
         print(f"Model loaded from {path}")
-
-
-def main(args):
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-
-    device = torch.device(
-        config["training"]["device"] if torch.cuda.is_available() else "cpu"
-    )
-
-    # ==================== Data ====================
-    print("Loading datasets...")
-    dataloaders = get_dataloaders(config)
-    train_loader = dataloaders["train"]
-    val_loader = dataloaders["val"]
-    test_loader = dataloaders["test"]
-
-    # ==================== Model ====================
-    print("\nInitializing CluSTAR components...")
-    encoder = SpatialEncoder(
-        img_size=config["data"]["img_size"],
-        canvas_size=config["data"]["canvas_size"],
-        output_dim=config["reservoir"]["encoder"]["output_dim"],
-        encoder_type=config["reservoir"]["encoder"]["type"],
-    )
-    reservoir = ClusteredReservoir(
-        input_dim=config["reservoir"]["encoder"]["output_dim"],
-        reservoir_size=config["reservoir"]["size"],
-        num_clusters=config["reservoir"]["num_clusters"],
-        cluster_connectivity=config["reservoir"]["cluster"]["within_prob"],
-        inter_cluster_connectivity=config["reservoir"]["cluster"]["between_prob"],
-        spectral_radius_global=config["reservoir"]["spectral_radius_global"],
-        seed=config["training"]["seed"],
-    )
-
-    # ==================== Fine-tuning ====================
-    classifier = ActionClassifier(
-        reservoir=reservoir,
-        encoder=encoder,
-        config=config,
-        checkpoint_path=args.checkpoint,
-    )
-
-    # Train classifier
-    metrics = classifier.train_classifier(train_loader, val_loader)
-
-    # Test
-    test_metrics = classifier.test(test_loader)
-
-    # Save
-    classifier.save_model("checkpoints/finetuned_classifier.pt")
-
-    # Save metrics
-    with open("logs/finetune_metrics.json", "w") as f:
-        json.dump({**metrics, **test_metrics}, f, indent=2)
-
-    return test_metrics
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CluSTAR Fine-tuning")
-    parser.add_argument("--config", type=str, default="configs/reservoir.yaml")
-    parser.add_argument(
-        "--checkpoint", type=str, default=None, help="Pre-trained checkpoint path"
-    )
-    args = parser.parse_args()
-
-    main(args)

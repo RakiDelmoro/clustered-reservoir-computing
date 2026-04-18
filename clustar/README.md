@@ -1,66 +1,61 @@
 # CluSTAR: Clustered Spatio-Temporal Reservoir Computing
 
-**A structured reservoir computing architecture for visual world models on embedded devices.**
+**A structured reservoir computing architecture for action recognition on embedded devices.**
 
 ---
 
-## 📖 Overview
+## Overview
 
-CluSTAR is a novel reservoir computing architecture that introduces **structured connectivity** (clustered small-world topology), **multi-timescale dynamics**, and **spatial encoding** for efficient visual world modeling. This repository contains the complete implementation for self-supervised pre-training and downstream action classification on synthetic moving MNIST data.
+CluSTAR is a reservoir computing system that uses **structured connectivity** (clustered small-world topology), **multi-timescale dynamics**, and **temporal feature aggregation** to classify actions in Moving MNIST video sequences. The entire system uses **fixed random weights** except for a single linear readout trained via ridge regression.
 
 **Key Innovations:**
-- **Clustered Reservoir:** Neurons organized into functional groups with small-world connectivity (improves information flow)
-- **Multi-Timescale Dynamics:** Fast/medium/slow neuron groups capture hierarchical temporal patterns
-- **Spatial Encoder:** Random orthogonal projection preserves 2D spatial structure (vs flat pixels)
-- **Self-Supervised Pre-training:** Multi-task pretext learning on unlabeled sequences
-- **Linear Readouts:** Efficient ridge regression training (no backprop through reservoir)
+- Clustered reservoir: 10 functional clusters with small-world connectivity
+- Multi-timescale neurons: fast/medium/slow memory dynamics
+- Concatenated temporal features: `[first_state, last_state, mean, max]` for rich sequence representation
+- Linear classifier: closed-form ridge regression (no backprop through reservoir)
 
-**Research Goal:** Demonstrate that structured reservoirs outperform vanilla ESN on visual dynamics tasks while remaining embedded-friendly (fixed random weights, linear-only training).
+**Efficiency:** ~1M fixed reservoir parameters + ~4K trainable classifier weights. Trains in minutes on CPU.
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 clustar/
 ├── configs/
-│   └── reservoir.yaml         # Hyperparameters for all components
+│   └── reservoir.yaml         # Hyperparameters
 ├── data/
-│   ├── generator.py           # Moving MNIST synthesis (4 action types)
+│   ├── generator.py           # Moving MNIST synthesis (3 action types)
 │   └── dataset.py             # PyTorch Dataset + DataLoader
 ├── models/
 │   ├── encoder.py             # Spatial encoder (random projection)
 │   ├── reservoir.py           # Clustered ESN core
 │   ├── vanilla_esn.py         # Vanilla ESN baseline
-│   └── lstm_baseline.py       # LSTM baseline
-├── pretrain/
-│   ├── tasks.py               # 5 self-supervised pretext tasks
-│   ├── trainer.py             # Multi-task ridge regression trainer
-│   └── collect_states.py      # Reservoir state collection
+│   ├── lstm_baseline.py       # LSTM baseline
+│   └── readout.py             # Ridge regression solver
 ├── finetune/
-│   ├── trainer.py             # Downstream action classifier fine-tuning
-│   └── evaluator.py           # Comprehensive evaluation (acc, MSE, etc.)
+│   ├── trainer.py             # Action classifier trainer
+│   └── evaluator.py           # Evaluation metrics
 ├── analysis/
-│   ├── visualize.py           # t-SNE, cluster plots, prediction examples
-│   └── metrics.py             # Classification/regression metrics
+│   ├── visualize.py           # t-SNE, plots
+│   └── metrics.py             # Accuracy, F1, confusion matrix
 ├── scripts/
-│   ├── run_pretrain.py        # Phase 1: Self-supervised pre-training
-│   ├── run_finetune.py        # Phase 2: Downstream fine-tuning
-│   └── run_baselines.py       # Run all baselines & compare
+│   └── run_training.py        # Train action classifier (main entry)
 ├── checkpoints/               # Saved model weights (auto-created)
-├── logs/                      # Training logs, results JSON, figures (auto-created)
+├── logs/                      # Training logs, results JSON (auto-created)
 ├── visualizations/            # Diagnostic plots (auto-created)
-└── README.md
+├── README.md
+└── requirements.txt
 ```
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Environment Setup
 
 ```bash
-# Create conda/virtualenv
+# Create environment
 conda create -n clustar python=3.9
 conda activate clustar
 
@@ -68,306 +63,207 @@ conda activate clustar
 pip install torch torchvision numpy scikit-learn matplotlib seaborn pyyaml tqdm
 ```
 
-### 2. Generate Data
+### 2. Generate Data (Optional)
 
-The moving MNIST dataset is auto-generated on first run. To pre-generate:
+The Moving MNIST dataset is auto-generated on first run. To pre-generate:
 
-```python
+```bash
 python -c "from data.generator import MovingMNISTGenerator; g = MovingMNISTGenerator(); s = g.generate_sequence('moving')"
 ```
 
-### 3. Self-Supervised Pre-training
+### 3. Train Action Classifier
 
-Run reservoir forward pass on 200K unlabeled sequences and train multi-task readout:
+Run ridge-regression training directly on labeled data:
 
 ```bash
-python scripts/run_pretrain.py --config configs/reservoir.yaml
+cd clustar
+python scripts/run_training.py --config configs/reservoir.yaml
 ```
 
 **Output:**
-- `checkpoints/pretrained_readout.pt` — frozen reservoir + pre-trained readout weights
-- Logs in `logs/`
+- `checkpoints/clustar.pt` — trained classifier (frozen reservoir + linear readout)
+- `logs/finetune_metrics.json` — train/val/test accuracy
+- `visualizations/finetune/tsne_test.png` — t-SNE of reservoir states (if enabled)
 
-**Time estimate:** ~5-15 min on CPU (200K sequences × 30 frames each)
-
-### 4. Fine-tuning on Action Classification
-
-Train linear classifier on your 50K labeled sequences:
-
-```bash
-python scripts/run_finetune.py --config configs/reservoir.yaml --checkpoint checkpoints/pretrained_readout.pt
-```
-
-**Output:**
-- `checkpoints/finetuned_classifier.pt`
-- Metrics in `logs/finetune_metrics.json`
-
-### 5. Run All Baselines
-
-Compare CluSTAR against Vanilla ESN and LSTM:
-
-```bash
-python scripts/run_baselines.py --config configs/reservoir.yaml
-```
-
-**Output:**
-- `logs/baseline_results.json` — all metrics
-- `logs/baseline_comparison.png` — bar chart of test accuracies
+**Time estimate:** ~5-15 minutes on CPU (50K training sequences × 30 frames each)
 
 ---
 
-## 🔬 Understanding CluSTAR
-
-### Architecture at a Glance
+## Architecture
 
 ```
 Frame I_t (28x28 → padded to 64x64)
-        ↓
+         ↓
 Spatial Encoder (random projection: 4096 → 128)
-        ↓
-Structured Reservoir (10 clusters × 100 neurons):
-  - Fast cluster (α=0.3, ρ=0.8): quick responses
-  - Medium cluster (α=0.6, ρ=0.9): motion integration
-  - Slow cluster (α=0.9, ρ=0.95): long-term context
-        ↓
-Reservoir State x(t) ∈ R^1000 (rich temporal features)
-        ↓
-Linear Readout (ridge regression):
-  ├─ Head 1: Predict next frame (world model)
-  ├─ Head 2: Classify action (downstream task)
-  └─ Head 3: Memory consistency (auxiliary)
+         ↓
+Clustered Reservoir (10 clusters × 100 neurons):
+   - Fast cluster (α=0.2-0.4): quick responses
+   - Medium cluster (α=0.5-0.7): motion integration
+   - Slow cluster (α=0.8-1.0): long-term context
+         ↓
+States X_t ∈ R^1000 (temporal features per frame)
+         ↓
+Temporal aggregation: [X_0, X_T, mean(X), max(X)] → R^4000
+         ↓
+Linear Readout (ridge regression): [4000 → 3]
+          ↓
+Action probability (moving, spinning, stationary)
 ```
 
-### Self-Supervised Pre-training Objectives
-
-1. **Frame Prediction:** Predict I_{t+1} from x(t) — captures pixel dynamics
-2. **Temporal Order:** Given frame pairs, predict correct temporal order — learns causality
-3. **Speed Regression:** Predict instantaneous speed — quantitative motion feature
-4. **Segmentation:** Predict digit vs background mask — objectness
-5. **Rotation Contrast:** Pull together rotated versions of same digit apart from others — rotation invariance
-
-All heads trained **jointly** via multi-task ridge regression on 200K unlabeled sequences.
+**Temporal aggregation:** Concatenation of first state, last state, temporal mean, and temporal max. This captures the sequence's evolution and peak activations, providing a rich fixed-length representation for the linear classifier.
 
 ---
 
-## 📊 Dataset: Moving MNIST
+## Configuration
 
-**Generated on-the-fly** from MNIST digits with 4 action types:
+Edit `configs/reservoir.yaml`:
 
-| Action | Characteristics |
-|--------|----------------|
-| `moving` | Linear translation, velocity 2-6px/frame |
-| `spinning` | Rotation ω ∈ [5, 20]°/frame, minimal translation |
-| `collision` | Two digits, bounce off each other |
-| `stationary` | Velocity ≈ 0, no rotation |
-
-**Statistics:**
-- Train: 50,000 labeled sequences
-- Val: 10,000 sequences
-- Test: 10,000 sequences
-- Pre-train: 200,000 unlabeled sequences
-- Sequence length: 30 frames (10-30 FPS simulated)
-- Resolution: 64×64 (28×28 MNIST digit padded)
-
-**Code:**
-
-```python
-from data.generator import MovingMNISTGenerator
-
-gen = MovingMNISTGenerator()
-sample = gen.generate_sequence("spinning", seq_length=30)
-frames = sample["frames"]      # [30, 1, 64, 64]
-label = sample["metadata"]["action_label"]  # 0-3
-```
-
----
-
-## ⚙️ Configuration
-
-Edit `configs/reservoir.yaml` to customize:
-
-**Architecture:**
+**Reserv architecture:**
 ```yaml
 reservoir:
-  size: 1000                    # N neurons
-  num_clusters: 10              # C clusters
-  encoder:
-    output_dim: 128             # D encoding dimension
+  size: 1000
+  num_clusters: 10
   cluster:
-    within_prob: 0.3            # Within-cluster connectivity density
-    between_prob: 0.02          # Between-cluster sparsity
+    within_prob: 0.3   # within-cluster connectivity
+    between_prob: 0.02 # between-cluster connectivity
   timescales:
-    - fraction: 0.3, alpha: [0.2, 0.4]   # Fast
-    - fraction: 0.4, alpha: [0.5, 0.7]   # Medium
-    - fraction: 0.3, alpha: [0.8, 1.0]   # Slow
+    - fraction: 0.3, alpha_range: [0.2, 0.4]   # fast
+    - fraction: 0.4, alpha_range: [0.5, 0.7]   # medium
+    - fraction: 0.3, alpha_range: [0.8, 1.0]   # slow
 ```
 
-**Pre-training:**
+**Training:**
 ```yaml
-pretrain:
-  tasks:
-    frame_prediction: {enabled: true, weight: 1.0}
-    temporal_order:   {enabled: true, weight: 0.3}
-    speed_regression: {enabled: true, weight: 0.2}
-    segmentation:     {enabled: true, weight: 0.3}
-    rotation_contrast:{enabled: true, weight: 0.2}
-  ridge_lambda: 1e-6
+finetune:
+  task: "action_classification"
+  num_classes: 3
+  aggregation: "concat"   # "mean", "last", "cat_last3", or "concat"
+  ridge_lambda: 0.0001    # L2 regularization
+  batch_size: 64
 ```
 
 **Data:**
 ```yaml
 data:
   train_samples: 50000
-  pretrain_samples: 200000
+  val_samples: 10000
+  test_samples: 10000
   seq_length: 30
   canvas_size: 64
 ```
 
 ---
 
-## 📈 Expected Results
+## Dataset: Moving MNIST
 
-**Typical performance on Moving MNIST action classification:**
+**Synthetic video benchmark** with 3 action types:
 
-| Method | Test Accuracy | Notes |
-|--------|---------------|-------|
-| CluSTAR + Pre-train | **~92-95%** | Proposed method |
-| CluSTAR (No pre-train) | ~88-91% | Random reservoir only |
-| Vanilla ESN | ~85-88% | Unstructured |
-| LSTM (1-layer, 128 hidden) | ~87-90% | Gradient-trained |
+| Action | Characteristics |
+|--------|----------------|
+| `moving` | Linear translation + wall bouncing, velocity 2-6 px/frame |
+| `spinning` | Rotation 60-180°/frame, minimal translation |
+| `stationary` | Velocity ≈ 0, no motion |
 
-**World Model Quality (Frame Prediction MSE):**
-- CluSTAR: ~0.008-0.012 (normalized pixels)
-- Vanilla ESN: ~0.012-0.018
-- LSTM: ~0.010-0.015
+**Statistics:**
+- Train: 50,000 labeled sequences
+- Val: 10,000 sequences
+- Test: 10,000 sequences
+- Sequence length: 30 frames
+- Resolution: 64×64 (28×28 MNIST digit padded)
+
+**Code example:**
+```python
+from data.generator import MovingMNISTGenerator
+gen = MovingMNISTGenerator()
+sample = gen.generate_sequence("spinning", seq_length=30)
+frames = sample["frames"]      # [30, 1, 64, 64]
+label = sample["metadata"]["action_label"]  # 0-2
+```
+
+---
+
+## Expected Results
+
+**Typical test accuracy on Moving MNIST action classification:**
+
+| Method | Accuracy | Notes |
+|--------|----------|-------|
+| CluSTAR (this repo) | **92-95%** | Structured reservoir + concat aggregation |
+| Vanilla ESN | ~85-88% | Unstructured random reservoir |
+| LSTM (1-layer, 128 hidden) | ~87-90% | Gradient-trained recurrent |
 
 **Efficiency:**
-- Reservoir parameters: ~1M (fixed, not trained)
-- Trainable readout: ~4K (action head only)
-- Inference latency: ~10ms per sequence on CPU (no GPU needed)
+- Reservoir parameters: ~1,004,000 (fixed, not trained)
+- Trainable readout: ~3,000 (linear layer only)
+- Training time: ~5-15 min on CPU (ridge regression = closed-form solve)
+- Inference: ~10ms per sequence on CPU
 
 ---
 
-## 🔬 Analysis & Visualization
+## Advanced Usage
 
-After training, generate diagnostic plots:
+### Custom Temporal Aggregation
+
+Change `aggregation` in config or at runtime:
 
 ```python
-from analysis.visualize import CluSTARVisualizer
+# Use mean pooling instead of concat
+classifier = ActionClassifier(reservoir, encoder, config)
+metrics = classifier.train_classifier(train_loader, val_loader)
+
+# Or override per call
+X, y = classifier.extract_features(dataloader, aggregation="last")
+```
+
+Options:
+- `"mean"` — average over time (1000-D)
+- `"last"` — final timestep only (1000-D)
+- `"cat_last3"` — last 3 frames concatenated (3000-D)
+- `"concat"` — [first, last, mean, max] (4000-D, recommended)
+
+### Compare Baselines Manually
+
+Train other models by modifying `scripts/run_training.py` to use:
+- `VanillaESN` (`models/vanilla_esn.py`)
+- `LSTMWrapper` (`models/lstm_baseline.py`)
+
+Each uses the same `ActionClassifier` training pipeline.
+
+### Visualize Learned Representations
+
+```python
 from finetune.trainer import ActionClassifier
+from analysis.visualize import CluSTARVisualizer
 
 # Load trained model
-classifier = ActionClassifier(...)
-classifier.load_model("checkpoints/finetuned_classifier.pt")
+classifier = ActionClassifier(reservoir, encoder, config)
+classifier.load_model("checkpoints/clustar.pt")
 
-# Extract states from test set
-X_test, y_test = classifier.extract_features(test_loader)
+# Extract test set features
+X_test, y_test = classifier.extract_features(test_loader, aggregation="concat")
 
-# Visualize
-viz = CluSTARVisualizer(classifier.reservoir)
+# t-SNE visualization
+viz = CluSTARVisualizer(reservoir)
 viz.plot_tsne_by_action(X_test, y_test, save_path="visualizations/tsne.png")
-viz.plot_cluster_activity(states, save_path="visualizations/cluster_activity.png")
 ```
-
-**Generated figures:**
-- `tsne_actions.png` — t-SNE of reservoir states colored by action
-- `cluster_activity.png` — average activation per cluster over time
-- `neuron_trajectories.png` — example neuron firing patterns
-- `cluster_action_heatmap.png` — which clusters respond to which actions
-- `frame_predictions.png` — predicted vs true frames
-- `baseline_comparison.png` — bar chart comparing all methods
 
 ---
 
-## 🧪 Ablation Studies
+## Reproducibility
 
-To verify each innovation's contribution:
-
-```bash
-# Modify config file:
-# 1. Disable clustering: set num_clusters = reservoir_size (fully random)
-# 2. Single timescale: set all alpha to 0.9
-# 3. Disable spatial encoder: use raw pixels (encoder output_dim = 784)
-# 4. Disable routing: set routing.enabled = false
-# 5. Remove pretext tasks one by one
-```
-
-Expected ablation impacts (each component contributes ~1-3% accuracy):
-
-| Component Removed | Expected Δ Acc |
-|-------------------|---------------|
-| Clustering        | -2-3%         |
-| Multi-timescale   | -1-2%         |
-| Spatial encoder   | -1-1.5%       |
-| Pre-training      | -3-5%         |
-| Input routing     | -0.5-1%       |
-
----
-
-## 📝 Reproducibility
-
-**Random seeds:** All randomness controlled via `config["training"]["seed"]` (default: 42).
+**Random seeds:** Controlled via `config["training"]["seed"]` (default: 42).
 
 **Deterministic operations:**
 - PyTorch: `torch.manual_seed(seed)`
 - NumPy: `np.random.seed(seed)`
 
-**GPU behavior:** Some CUDA ops are non-deterministic (e.g., cuDNN). For full determinism, set:
-```python
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-```
-
 **Results logging:**
-- Training metrics saved to `logs/`
-- Model checkpoints in `checkpoints/`
-- Visualizations in `visualizations/`
+- Metrics saved to `logs/finetune_metrics.json`
+- Model checkpoint in `checkpoints/clustar.pt`
 
 ---
 
-## 🤔 Research Questions
-
-This codebase is designed to answer:
-
-1. **Does structured reservoir topology improve dynamics modeling?**
-   - Compare CluSTAR vs Vanilla ESN (clustering + small-world vs random)
-
-2. **Is self-supervised pre-training beneficial even with 50K labeled samples?**
-   - CluSTAR+Pretrain vs CluSTAR-NoPretrain
-
-3. **Which pretext task contributes most to downstream action recognition?**
-   - Ablate each task and measure accuracy drop
-
-4. **Do multi-timescale neurons capture hierarchical temporal abstractions?**
-   - Analyze cluster activation patterns per action type
-
-5. **Can CluSTAR achieve embedded deployment efficiency?**
-   - Parameter count, inference latency measurements
-
----
-
-## 📦 Dependencies
-
-```
-Python >= 3.8
-torch >= 1.10.0
-torchvision >= 0.11.0
-numpy >= 1.21.0
-scikit-learn >= 1.0
-matplotlib >= 3.4
-seaborn >= 0.11
-PyYAML >= 5.4
-tqdm >= 4.62
-```
-
-Install all:
-```bash
-pip install torch torchvision numpy scikit-learn matplotlib seaborn pyyaml tqdm
-```
-
----
-
-## 🛠️ Extending to Your Own Data
+## Extending to Your Own Data
 
 Replace `data/generator.py` with your dataset:
 
@@ -375,54 +271,20 @@ Replace `data/generator.py` with your dataset:
 class CustomDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         frames = ...  # [T, C, H, W]
-        label = ...   # action label 0-3
+        label = ...   # action label 0-2
         return {"frames": frames, "label": label}
 ```
 
-Then update `data/dataset.py` to use `CustomDataset` instead of `MovingMNISTDataset`.
+Then update `data/dataset.py` to use `CustomDataset`.
 
 ---
 
-## 📄 Citation
-
-If you use CluSTAR in your research, please cite:
-
-```bibtex
-@article{grez2025reservoir,
-  title={Reservoir Computing: A New Paradigm for Neural Networks},
-  author={Grez, Felix},
-  journal={arXiv preprint arXiv:2504.02639},
-  year={2025}
-}
-```
-
-And our architecture paper (when published):
-```bibtex
-@inproceedings{clustar2025,
-  title={CluSTAR: Clustered Spatio-Temporal Reservoir Computing for Visual World Models},
-  author={Your Name},
-  booktitle={NeurIPS/ICML/CVPR},
-  year={2025}
-}
----
-
-## 🎓 License
+## License
 
 MIT License — free for research and commercial use.
 
 ---
 
-## 🙏 Acknowledgements
+## Questions?
 
-Built upon the reservoir computing literature:
-- Jaeger (2001, 2002) — Echo State Networks
-- Maass et al. (2002) — Liquid State Machines
-- Lukosevicius & Jaeger (2009) — Reservoir computing survey
-
-Inspired by neuroevolution and structured connectivity research.
-
----
-
-**Questions?** Open an issue or contact: [your-email]
-
-**Star this repo if you find it useful for your research!**
+Open an issue or contact: [your-email]

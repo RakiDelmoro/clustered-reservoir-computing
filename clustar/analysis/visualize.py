@@ -1,14 +1,18 @@
 """
 Visualization Tools for CluSTAR Analysis.
-Reservoir state trajectories, cluster activations, predictions, t-SNE.
+t-SNE + confusion matrix for action classification evaluation.
 """
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict, Optional, List
+from pathlib import Path
+from typing import Optional, List
 from sklearn.manifold import TSNE
-import seaborn as sns
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, silhouette_score
+from sklearn.preprocessing import StandardScaler
+from packaging import version
 
 
 class CluSTARVisualizer:
@@ -21,57 +25,114 @@ class CluSTARVisualizer:
         self.action_names = action_names or [
             "moving",
             "spinning",
-            "collision",
             "stationary",
         ]
         self.cluster_assignments = reservoir.cluster_assignments.cpu().numpy()
         self.num_clusters = reservoir.num_clusters
 
-    def plot_reservoir_dynamics(
+    def plot_tsne_by_action(
         self,
-        states: torch.Tensor,
-        sequence_idx: int = 0,
-        max_neurons: int = 20,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        model_accuracy: Optional[float] = None,
+        perplexity: int = 50,
         save_path: Optional[str] = None,
     ):
         """
-        Plot reservoir state trajectories over time for selected neurons.
+        t-SNE of reservoir features colored by action class.
+        Side-by-side: t-SNE scatter (left) + linear probe confusion matrix (right).
 
         Args:
-            states: [B, T, N] reservoir states
-            sequence_idx: which sequence to visualize
-            max_neurons: plot at most N neuron trajectories
+            features: [B, feature_dim] already aggregated and standardized features
+            labels: [B] action labels
+            model_accuracy: actual model test accuracy (displayed on plot for context)
+            perplexity: t-SNE perplexity
+            save_path: where to save plot
         """
-        seq_states = states[sequence_idx].cpu().numpy()  # [T, N]
-        T, N = seq_states.shape
+        B = features.shape[0]
+        features_np = features.cpu().numpy()
+        labels_np = labels.cpu().numpy()
 
-        # Select neurons to plot (first from each cluster)
-        neurons_to_plot = []
-        for c in range(self.num_clusters):
-            cluster_neurons = np.where(self.cluster_assignments == c)[0]
-            if len(cluster_neurons) > 0:
-                neurons_to_plot.append(cluster_neurons[0])  # first neuron in cluster
-        neurons_to_plot = neurons_to_plot[:max_neurons]
+        states_scaled = StandardScaler().fit_transform(features_np)
 
-        plt.figure(figsize=(12, 6))
-        time = np.arange(T)
-        for i, neuron_idx in enumerate(neurons_to_plot):
-            cluster_id = self.cluster_assignments[neuron_idx]
-            plt.plot(
-                time,
-                seq_states[:, neuron_idx],
-                label=f"Cluster {cluster_id}",
-                alpha=0.7,
+        effective_perplexity = min(perplexity, B - 1)
+        if effective_perplexity != perplexity:
+            print(
+                f"  Note: Adjusting perplexity from {perplexity} to {effective_perplexity} (dataset size={B})"
             )
 
-        plt.xlabel("Time Step")
-        plt.ylabel("Activation")
-        plt.title(f"Reservoir Neuron Trajectories (Sequence {sequence_idx})")
-        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8, ncol=2)
-        plt.grid(True, alpha=0.3)
+        print("Running t-SNE...")
+        tsne_params = {
+            "n_components": 2,
+            "perplexity": effective_perplexity,
+            "random_state": 42,
+        }
+        if version.parse(__import__("sklearn").__version__) >= version.parse("0.24"):
+            tsne_params["max_iter"] = 1000
+        else:
+            tsne_params["n_iter"] = 1000
+        tsne = TSNE(**tsne_params)
+        states_2d = tsne.fit_transform(states_scaled)
+
+        linear_probe = LogisticRegression(max_iter=1000)
+        linear_probe.fit(states_2d, labels_np)
+        tsne_accuracy = linear_probe.score(states_2d, labels_np)
+        sil_score = silhouette_score(states_2d, labels_np)
+
+        preds = linear_probe.predict(states_2d)
+        cm = confusion_matrix(labels_np, preds)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cm_norm = cm.astype("float") / cm.sum(axis=1)[:, np.newaxis]
+        cm_norm = np.nan_to_num(cm_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        # LEFT: t-SNE scatter
+        scatter = axes[0].scatter(
+            states_2d[:, 0], states_2d[:, 1], c=labels_np, cmap="tab10", alpha=0.6, s=20
+        )
+        axes[0].set_xlabel("t-SNE Component 1")
+        axes[0].set_ylabel("t-SNE Component 2")
+
+        title_lines = [f"2D Probe: {tsne_accuracy:.1%} | Silhouette: {sil_score:.3f}"]
+        if model_accuracy is not None:
+            title_lines.insert(0, f"Model Acc: {model_accuracy:.1%}")
+        axes[0].set_title("t-SNE (per-cluster features)\n" + " | ".join(title_lines))
+        axes[0].grid(True, alpha=0.3)
+
+        handles, _ = scatter.legend_elements()
+        unique_classes = np.unique(labels_np)
+        legend_names = [self.action_names[c] for c in unique_classes]
+        axes[0].legend(handles=handles, labels=legend_names, title="Action")
+
+        # RIGHT: Confusion matrix
+        axes[1].set_title("2D Linear Probe Confusion Matrix")
+        axes[1].set_xlabel("Predicted label")
+        axes[1].set_ylabel("True label")
+        tick_marks = np.arange(len(self.action_names))
+        axes[1].set_xticks(tick_marks)
+        axes[1].set_yticks(tick_marks)
+        axes[1].set_xticklabels(self.action_names, rotation=45, ha="right")
+        axes[1].set_yticklabels(self.action_names)
+
+        im = axes[1].imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
+        for i in range(cm_norm.shape[0]):
+            for j in range(cm_norm.shape[1]):
+                axes[1].text(
+                    j,
+                    i,
+                    f"{cm_norm[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    color="white" if cm_norm[i, j] > 0.5 else "black",
+                )
+
         plt.tight_layout()
         if save_path:
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"  Saved plot to {save_path}")
         plt.close()
 
     def plot_cluster_activity(
@@ -79,9 +140,9 @@ class CluSTARVisualizer:
     ):
         """
         Plot average activation per cluster over time.
+        states: [B, T, N]
         """
-        # states: [B, T, N]
-        states_np = states.mean(dim=0).cpu().numpy()  # [T, N] (avg over batch)
+        states_np = states.mean(dim=0).cpu().numpy()
 
         cluster_means = np.zeros((states_np.shape[0], self.num_clusters))
         for c in range(self.num_clusters):
@@ -102,80 +163,6 @@ class CluSTARVisualizer:
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close()
 
-    def plot_tsne_by_action(
-        self,
-        states: torch.Tensor,
-        labels: torch.Tensor,
-        perplexity: int = 30,
-        save_path: Optional[str] = None,
-    ):
-        """
-        t-SNE of reservoir states colored by action class.
-        """
-        B = states.shape[0]
-        # Use last timestep state for each sequence
-        states_agg = states[:, -1, :].cpu().numpy()  # [B, N]
-        labels_np = labels.cpu().numpy()
-
-        print("Running t-SNE...")
-        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, n_iter=1000)
-        states_2d = tsne.fit_transform(states_agg)
-
-        plt.figure(figsize=(10, 8))
-        scatter = plt.scatter(
-            states_2d[:, 0], states_2d[:, 1], c=labels_np, cmap="tab10", alpha=0.6, s=20
-        )
-        plt.legend(
-            handles=scatter.legend_elements()[0],
-            labels=self.action_names,
-            title="Action",
-        )
-        plt.xlabel("t-SNE Component 1")
-        plt.ylabel("t-SNE Component 2")
-        plt.title("Reservoir State Embeddings by Action Label")
-        plt.grid(True, alpha=0.3)
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close()
-
-    def plot_frame_predictions(
-        self,
-        frames_true: torch.Tensor,
-        frames_pred: torch.Tensor,
-        num_examples: int = 5,
-        save_path: Optional[str] = None,
-    ):
-        """
-        Show true vs predicted frames side-by-side.
-        """
-        B = min(num_examples, frames_true.shape[0])
-        fig, axes = plt.subplots(B, 3, figsize=(8, B * 2.5))
-
-        if B == 1:
-            axes = axes.reshape(1, -1)
-
-        for i in range(B):
-            # Show true frame at t
-            axes[i, 0].imshow(frames_true[i, 0, 0].cpu(), cmap="gray")
-            axes[i, 0].set_title("True (t)")
-            axes[i, 0].axis("off")
-
-            # Show true frame at t+1
-            axes[i, 1].imshow(frames_true[i, 1, 0].cpu(), cmap="gray")
-            axes[i, 1].set_title("True (t+1)")
-            axes[i, 1].axis("off")
-
-            # Show predicted frame
-            axes[i, 2].imshow(frames_pred[i, 0].cpu().reshape(64, 64), cmap="gray")
-            axes[i, 2].set_title("Predicted")
-            axes[i, 2].axis("off")
-
-        plt.suptitle("Frame Prediction Examples")
-        plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close()
-
     def plot_cluster_correlations(
         self,
         states: torch.Tensor,
@@ -184,8 +171,11 @@ class CluSTARVisualizer:
     ):
         """
         Heatmap of average cluster activation per action class.
+        states: [B, T, N]
         """
-        states_np = states.mean(dim=1).cpu().numpy()  # [B, N] (avg over time)
+        import seaborn as sns
+
+        states_np = states.mean(dim=1).cpu().numpy()
         labels_np = labels.cpu().numpy()
 
         cluster_means_per_class = np.zeros((self.num_clusters, len(self.action_names)))
@@ -193,7 +183,7 @@ class CluSTARVisualizer:
         for c in range(self.num_clusters):
             mask = self.cluster_assignments == c
             if mask.sum() > 0:
-                cluster_states = states_np[:, mask].mean(axis=1)  # [B]
+                cluster_states = states_np[:, mask].mean(axis=1)
                 for a in range(len(self.action_names)):
                     class_mask = labels_np == a
                     cluster_means_per_class[c, a] = cluster_states[class_mask].mean()
@@ -210,82 +200,8 @@ class CluSTARVisualizer:
         )
         plt.xlabel("Action Class")
         plt.ylabel("Cluster")
-        plt.title("Cluster Activation by Action (averaged over sequences)")
+        plt.title("Cluster Activation by Action")
         plt.tight_layout()
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close()
-
-    def save_all_visualizations(
-        self,
-        states: torch.Tensor,
-        frames: torch.Tensor,
-        labels: torch.Tensor,
-        preds: Optional[torch.Tensor] = None,
-        pred_frames: Optional[torch.Tensor] = None,
-        output_dir: str = "visualizations",
-    ):
-        """
-        Generate and save all diagnostic plots.
-        """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        print("Generating visualizations...")
-
-        # 1. t-SNE colored by action
-        self.plot_tsne_by_action(
-            states, labels, save_path=output_dir / "tsne_actions.png"
-        )
-
-        # 2. Cluster activity over time (avg over batch)
-        self.plot_cluster_activity(
-            states, save_path=output_dir / "cluster_activity.png"
-        )
-
-        # 3. Sample neuron trajectories
-        self.plot_reservoir_dynamics(
-            states, sequence_idx=0, save_path=output_dir / "neuron_trajectories.png"
-        )
-
-        # 4. Cluster activation heatmap
-        self.plot_cluster_correlations(
-            states, labels, save_path=output_dir / "cluster_action_heatmap.png"
-        )
-
-        # 5. Frame predictions (if available)
-        if pred_frames is not None:
-            self.plot_frame_predictions(
-                frames[:, :2],
-                pred_frames[:5],
-                save_path=output_dir / "frame_predictions.png",
-            )
-
-        print(f"Visualizations saved to {output_dir}/")
-
-
-def test_visualizer():
-    """Quick test."""
-    from models.reservoir import ClusteredReservoir
-    from models.encoder import SpatialEncoder
-
-    reservoir = ClusteredReservoir(
-        input_dim=128, reservoir_size=500, num_clusters=5, seed=42
-    )
-    encoder = SpatialEncoder(output_dim=128)
-
-    # Dummy data
-    B, T, N = 10, 30, 500
-    states = torch.randn(B, T, N)
-    labels = torch.randint(0, 4, (B,))
-
-    viz = CluSTARVisualizer(reservoir)
-    viz.plot_tsne_by_action(states, labels, save_path="test_tsne.png")
-    viz.plot_reservoir_dynamics(states, save_path="test_trajectories.png")
-    viz.plot_cluster_activity(states, save_path="test_cluster_activity.png")
-
-    print("Visualizer tests passed!")
-
-
-if __name__ == "__main__":
-    test_visualizer()

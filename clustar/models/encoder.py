@@ -1,6 +1,7 @@
 """
-Spatial Encoder for CluSTAR.
-Random projection layer that preserves spatial correlations.
+Spatiotemporal Encoder for CluSTAR.
+Dual-stream encoder: spatial stream (current frame) + temporal stream (frame difference).
+Both streams use fixed random orthogonal projections — no training required.
 """
 
 import torch
@@ -8,124 +9,69 @@ import torch.nn as nn
 import numpy as np
 
 
-class RandomOrthogonalProjection(nn.Module):
+class SpatiotemporalEncoder(nn.Module):
     """
-    Fixed random orthogonal projection for dimensionality reduction.
-    Preserves inner-product structure (like Johnson-Lindenstrauss).
-    """
+    Dual-stream encoder that produces motion-aware embeddings:
+      z_spatial  = W_s @ flatten(I_t)              — "WHAT is it?"
+      z_temporal = W_t @ flatten(I_t - I_{t-1})    — "IS IT MOVING?"
+      z = [z_spatial ; z_temporal]
 
-    def __init__(self, input_dim: int, output_dim: int, seed: int = 42):
-        super().__init__()
-        rng = np.random.RandomState(seed)
-
-        # Random projection matrix (Johnson-Lindenstrauss)
-        # Weight shape: [output_dim, input_dim] for multiplication: x @ W.T
-        weight = rng.randn(output_dim, input_dim) / np.sqrt(input_dim)
-
-        # Fixed weights — not trainable
-        self.register_buffer("weight", torch.tensor(weight, dtype=torch.float32))
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [..., input_dim] or [..., H, W] (will flatten)
-
-        Returns:
-            [..., output_dim]
-        """
-        if x.dim() == 3:  # [B, H, W]
-            x = x.flatten(start_dim=1)
-        elif x.dim() == 2:
-            pass
-        else:
-            raise ValueError(f"Unexpected input shape: {x.shape}")
-
-        return torch.matmul(x, self.weight.T)
-
-
-class SpatialEncoder(nn.Module):
-    """
-    Encapsulates spatial encoding: flatten + random projection.
+    For the first frame (no previous frame), the temporal stream outputs zeros.
+    Both W_s and W_t are fixed random orthogonal projections (Johnson-Lindenstrauss).
     """
 
     def __init__(
         self,
-        img_size: int = 28,
         canvas_size: int = 64,
-        output_dim: int = 128,
-        encoder_type: str = "random_orthogonal",
+        spatial_dim: int = 256,
+        temporal_dim: int = 256,
         seed: int = 42,
     ):
         super().__init__()
-        self.img_size = img_size
         self.canvas_size = canvas_size
-        self.output_dim = output_dim
+        self.spatial_dim = spatial_dim
+        self.temporal_dim = temporal_dim
+        self.output_dim = spatial_dim + temporal_dim
 
-        if encoder_type == "random_orthogonal":
-            # Input is flattened frame (canvas_size^2)
-            input_dim = canvas_size * canvas_size
-            self.encoder = RandomOrthogonalProjection(
-                input_dim=input_dim, output_dim=output_dim, seed=seed
-            )
-        elif encoder_type == "random_normal":
-            # Simple random weights (Gaussian)
-            input_dim = canvas_size * canvas_size
-            weight = torch.randn(output_dim, input_dim) * (1.0 / np.sqrt(input_dim))
-            self.register_buffer("weight", weight)
-            self.encoder = lambda x: torch.matmul(x.flatten(start_dim=1), self.weight.T)
-        else:
-            raise ValueError(f"Unknown encoder type: {encoder_type}")
+        input_dim = canvas_size * canvas_size
+        rng = np.random.RandomState(seed)
+
+        w_spatial = rng.randn(spatial_dim, input_dim) / np.sqrt(input_dim)
+        self.register_buffer("w_spatial", torch.tensor(w_spatial, dtype=torch.float32))
+
+        rng2 = np.random.RandomState(seed + 1000)
+        w_temporal = rng2.randn(temporal_dim, input_dim) / np.sqrt(input_dim)
+        self.register_buffer(
+            "w_temporal", torch.tensor(w_temporal, dtype=torch.float32)
+        )
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            frames: [B, T, C, H, W] or [B, C, H, W] or [C, H, W]
+            frames: [B, T, C, H, W]
 
         Returns:
-            encoded: [B, T, output_dim] or [B, output_dim] or [output_dim]
+            encoded: [B, T, output_dim]
         """
-        original_dim = frames.dim()
-        if original_dim == 5:  # [B, T, C, H, W]
-            B, T = frames.shape[0], frames.shape[1]
-            frames = frames.flatten(start_dim=0, end_dim=1)  # [B*T, C, H, W]
+        if frames.dim() != 5:
+            raise ValueError(
+                f"SpatiotemporalEncoder expects [B, T, C, H, W], got shape {frames.shape}"
+            )
 
-        # Flatten spatial dimensions
-        batch_size = frames.shape[0]
-        flat_frames = frames.view(batch_size, -1)  # [B_flat, H*W]
+        B, T, C, H, W = frames.shape
+        pixel_dim = H * W * C
 
-        encoded = self.encoder(flat_frames)  # [B_flat, output_dim]
+        flat = frames.reshape(B, T, pixel_dim)
 
-        if original_dim == 5:
-            encoded = encoded.view(B, T, -1)  # [B, T, output_dim]
-        elif original_dim == 4:
-            pass  # [B, output_dim]
-        elif original_dim == 3:
-            pass  # [output_dim]
+        z_spatial = torch.matmul(flat, self.w_spatial.T)
+
+        temporal_input = torch.zeros(
+            B, T, pixel_dim, device=frames.device, dtype=frames.dtype
+        )
+        temporal_input[:, 1:, :] = flat[:, 1:, :] - flat[:, :-1, :]
+
+        z_temporal = torch.matmul(temporal_input, self.w_temporal.T)
+
+        encoded = torch.cat([z_spatial, z_temporal], dim=-1)
 
         return encoded
-
-
-def test_encoder():
-    """Quick test."""
-    encoder = SpatialEncoder(
-        img_size=28, canvas_size=64, output_dim=128, encoder_type="random_orthogonal"
-    )
-    # Test: batch of sequences
-    x = torch.randn(32, 30, 1, 64, 64)
-    y = encoder(x)
-    print(f"Input: {x.shape} -> Output: {y.shape}")
-    assert y.shape == (32, 30, 128)
-
-    # Test: single frame batch
-    x2 = torch.randn(32, 1, 64, 64)
-    y2 = encoder(x2)
-    print(f"Single frame batch: {x2.shape} -> {y2.shape}")
-    assert y2.shape == (32, 128)
-
-    print("Encoder tests passed!")
-
-
-if __name__ == "__main__":
-    test_encoder()

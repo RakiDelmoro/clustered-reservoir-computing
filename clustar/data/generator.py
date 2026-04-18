@@ -1,6 +1,6 @@
 """
 Moving MNIST Dataset Generator
-Synthesizes sequences of moving MNIST digits with 4 action types.
+Synthesizes sequences of moving MNIST digits with 3 action types.
 Uses pre-loaded mnist.pkl for digit templates.
 """
 
@@ -10,12 +10,14 @@ import pickle
 import os
 from typing import Tuple, List, Dict, Optional
 import random
+from torchvision.transforms.functional import rotate as tv_rotate
+import torchvision.transforms
 
 
 class MovingMNISTGenerator:
     """
     Generates synthetic sequences of moving MNIST digits.
-    Actions: moving, spinning, collision, stationary
+    Actions: moving, spinning, stationary
     """
 
     def __init__(
@@ -83,16 +85,12 @@ class MovingMNISTGenerator:
             frames: [seq_length, 1, canvas_size, canvas_size]
             metadata: dict with action, velocities, positions, etc.
         """
-        assert action in ["moving", "spinning", "collision", "stationary"]
+        assert action in ["moving", "spinning", "stationary"]
 
         # Initialize canvas
         frames = torch.zeros(seq_length, 1, self.canvas_size, self.canvas_size)
 
-        # Initialize digit properties
-        if action == "collision" and self.num_digits >= 2:
-            num_digits_used = 2
-        else:
-            num_digits_used = self.num_digits
+        num_digits_used = 1
 
         digits = []
         for d in range(num_digits_used):
@@ -106,9 +104,8 @@ class MovingMNISTGenerator:
             # Velocity
             v_config = {
                 "moving": (2, 6),
-                "spinning": (0, 1),
-                "collision": (3, 7),
-                "stationary": (0, 0.5),
+                "spinning": (0, 0.1),
+                "stationary": (0, 0),
             }[action]
             speed = self.rng.uniform(*v_config)
             angle = self.rng.uniform(0, 2 * np.pi)
@@ -119,11 +116,10 @@ class MovingMNISTGenerator:
             rot_config = {
                 "moving": False,
                 "spinning": True,
-                "collision": False,
                 "stationary": False,
             }[action]
             if rot_config:
-                omega = self.rng.uniform(5, 20) * (1 if self.rng.rand() > 0.5 else -1)
+                omega = self.rng.uniform(60, 180) * (1 if self.rng.rand() > 0.5 else -1)
             else:
                 omega = 0.0
 
@@ -159,8 +155,16 @@ class MovingMNISTGenerator:
                         d_info["pos"][dim] = self.canvas_size - self.img_size
                         d_info["vel"][dim] *= -1
 
-                # Render digit onto canvas (simplified: no rotation for speed)
-                # For rotation, you'd need scipy.ndimage.rotate
+                # Render digit onto canvas (with rotation support)
+                digit_img = d_info["image"]  # [1, 28, 28]
+                if abs(d_info["angle"]) > 0.1:
+                    digit_img = tv_rotate(
+                        digit_img,
+                        -d_info["angle"],
+                        interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+                        expand=False,
+                    )
+
                 x, y = int(d_info["pos"][0]), int(d_info["pos"][1])
                 x1 = max(0, x)
                 y1 = max(0, y)
@@ -173,20 +177,10 @@ class MovingMNISTGenerator:
 
                 if x2 > x1 and y2 > y1:
                     canvas[0, y1:y2, x1:x2] = torch.maximum(
-                        canvas[0, y1:y2, x1:x2], d_info["image"][0, dy1:dy2, dx1:dx2]
+                        canvas[0, y1:y2, x1:x2], digit_img[0, dy1:dy2, dx1:dx2]
                     )
 
             frames[t] = canvas
-
-        # Check collision (if 2 digits)
-        collision_flag = False
-        if num_digits_used == 2:
-            d0, d1 = digits[0], digits[1]
-            pos0, size0 = d0["pos"], self.img_size
-            pos1, size1 = d1["pos"], self.img_size
-            # Overlap check
-            if abs(pos0[0] - pos1[0]) < size0 and abs(pos0[1] - pos1[1]) < size0:
-                collision_flag = True
 
         # Compile metadata
         avg_speed = np.mean([np.linalg.norm(d["vel"]) for d in digits])
@@ -194,13 +188,11 @@ class MovingMNISTGenerator:
 
         metadata = {
             "action": action,
-            "action_label": ["moving", "spinning", "collision", "stationary"].index(
-                action
-            ),
+            "action_label": ["moving", "spinning", "stationary"].index(action),
             "num_digits": num_digits_used,
             "avg_speed": float(avg_speed),
             "has_rotation": has_rotation,
-            "collision": collision_flag if action == "collision" else False,
+            "omega": float(digits[0]["omega"]) if digits else 0.0,
             "digit_classes": [d["class"] for d in digits],
             "trajectories": [d["pos"].copy() for d in digits],
         }
@@ -282,7 +274,6 @@ class MovingMNISTDataset(torch.utils.data.Dataset):
         return {
             "frames": sample["frames"],  # [T, 1, H, W]
             "label": sample["metadata"]["action_label"],
-            "metadata": sample["metadata"],
         }
 
 
@@ -296,7 +287,7 @@ def main_test():
     # Generate dataset
     dataset = MovingMNISTDataset(
         num_samples=100,
-        actions=["moving", "spinning", "collision", "stationary"],
+        actions=["moving", "spinning", "stationary"],
         seq_length=30,
         split="train",
     )
